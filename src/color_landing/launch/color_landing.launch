@@ -1,0 +1,3 @@
+<launch>
+    <node name="color_memory" pkg="color_landing" type="color_memory.py" output="screen"/>
+</launch>
