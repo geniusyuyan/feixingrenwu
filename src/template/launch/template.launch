@@ -2,6 +2,8 @@
     <!-- 启动颜色识别 -->
     <include file="$(find color_landing)/launch/color_landing.launch"/>
     
+    <rosparam file="$(find template)/config/template.yaml" command="load" />
+    
     <!-- 启动任务控制 -->
     <node name="template_node" pkg="template" type="template_node" output="screen"/>
 </launch>

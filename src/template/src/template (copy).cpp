@@ -33,7 +33,7 @@ std::map<int, std::vector<float>> target_points = {
 
 int target_color_id = 0;  // 目标颜色ID
 
-// ===== 新增：激光避障相关 =====
+// ===== 激光避障相关 =====
 std::vector<float> laser_ranges(360, 10.0); // /laser/scan 是 360 度
 float drone_x = 0.0, drone_y = 0.0;
 
@@ -61,6 +61,7 @@ void check_obstacle(int angle_deg, float &vx, float &vy, float safe_dist) {
     }
 }
 
+// ✅ 已优化：降速 + 扩展避障角度 + 速度限幅
 void get_avoidance_velocity(float target_x, float target_y, float &vx, float &vy) {
     drone_x = local_pos.pose.pose.position.x;
     drone_y = local_pos.pose.pose.position.y;
@@ -69,13 +70,32 @@ void get_avoidance_velocity(float target_x, float target_y, float &vx, float &vy
     float dy = target_y - drone_y;
     float dist = std::sqrt(dx*dx + dy*dy);
 
-    float base_speed = (dist > 1.0) ? 0.6f : 0.3f;
-    vx = (dist > 0.1f) ? (dx / dist) * base_speed : 0.0f;
-    vy = (dist > 0.1f) ? (dy / dist) * base_speed : 0.0f;
+    // 分段降速：大幅降低飞行速度，减少惯性冲撞
+    float base_speed = 0.0f;
+    if (dist > 2.0f) {
+        base_speed = 0.35f;   // 远距离
+    } else if (dist > 0.8f) {
+        base_speed = 0.25f;   // 中距离
+    } else {
+        base_speed = 0.15f;   // 近距离精细调整
+    }
 
-    const float SAFE_DIST = 1.2f;
-    for (int ang = 315; ang < 360; ++ang) check_obstacle(ang, vx, vy, SAFE_DIST);
-    for (int ang = 0; ang <= 45; ++ang)  check_obstacle(ang, vx, vy, SAFE_DIST);
+    if (dist > 0.1f) {
+        vx = (dx / dist) * base_speed;
+        vy = (dy / dist) * base_speed;
+    } else {
+        vx = 0.0f;
+        vy = 0.0f;
+    }
+
+    // 更保守的避障：安全距离增大，检测范围扩大到 ±90°
+    const float SAFE_DIST = 1.5f;
+    for (int ang = 270; ang < 360; ++ang) check_obstacle(ang, vx, vy, SAFE_DIST);
+    for (int ang = 0; ang <= 90; ++ang)  check_obstacle(ang, vx, vy, SAFE_DIST);
+
+    // 限制最大速度，防止避障力过猛
+    vx = satfunc(vx, 0.4f);
+    vy = satfunc(vy, 0.4f);
 }
 
 bool mission_pos_cruise_avoid(float x, float y, float z, float yaw, float err_max) {
@@ -144,7 +164,6 @@ int main(int argc, char **argv)
     // 订阅 MAVROS 话题
     ros::Subscriber state_sub = nh.subscribe<mavros_msgs::State>("mavros/state", 10, state_cb);
     ros::Subscriber local_pos_sub = nh.subscribe<nav_msgs::Odometry>("/mavros/local_position/odom", 10, local_pos_cb);
-    // ===== 新增：订阅激光 =====
     ros::Subscriber laser_sub = nh.subscribe<sensor_msgs::LaserScan>("/laser/scan", 10, laser_cb);
 
     // 发布控制指令
@@ -178,7 +197,7 @@ int main(int argc, char **argv)
     }
     ROS_INFO("飞控已连接");
 
-    setpoint_raw.type_mask = 960; // 64+128+256+512
+    setpoint_raw.type_mask = 960;
     setpoint_raw.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
     setpoint_raw.position.x = 0;
     setpoint_raw.position.y = 0;
@@ -221,7 +240,7 @@ int main(int argc, char **argv)
             last_request = ros::Time::now();
         }
 
-        mission_pos_cruise(0, 0, ALTITUDE, 0, err_max);
+        mission_pos_cruise_avoid(0, 0, ALTITUDE, 0, err_max);
         mavros_setpoint_pos_pub.publish(setpoint_raw);
 
         if (std::fabs(local_pos.pose.pose.position.z - ALTITUDE) < err_max)
@@ -244,14 +263,12 @@ int main(int argc, char **argv)
         ROS_WARN_THROTTLE(1.0, "mission_num = %d", mission_num);
 
         static int search_step = 0;
-        float search_points[3][2] = {{35, -2}, {35, 0}, {35, 2}};
 
         switch (mission_num)
         {
             case 1:
                 ROS_INFO_ONCE("任务1: 起飞悬停");
-                if (mission_pos_cruise(0, 0, ALTITUDE, 0, err_max))
-                {
+                if (mission_pos_cruise_avoid(0, 0, ALTITUDE, 0, err_max)) {
                     mission_num = 2;
                     last_request = ros::Time::now();
                 }
@@ -266,89 +283,146 @@ int main(int argc, char **argv)
                     mission_num = 3;
                     last_request = ros::Time::now();
                 }
+                mission_pos_cruise_avoid(0, 0, ALTITUDE, 0, err_max);
                 break;
-
             case 3:
-                ROS_INFO_ONCE("任务3: 飞往穿门前 (20, 0.2)");
-                if (mission_pos_cruise_avoid(20.0, 0.2, ALTITUDE, 0.0, err_max))
-                {
+                ROS_INFO_ONCE("任务3:go to (3.3, 1.2)");
+                if (mission_pos_cruise_avoid(3.3, 1.2, ALTITUDE, 0.0, err_max)) {
                     mission_num = 4;
                     last_request = ros::Time::now();
                 }
                 break;
-
-            case 4:
-                ROS_INFO_ONCE("任务4: 穿门 (24, 0.2)");
-                if (mission_pos_cruise_avoid(24.0, 0.2, ALTITUDE, 0.0, err_max))
-                {
-                    ROS_INFO("成功穿门！");
+	    case 4:
+                ROS_INFO_ONCE("任务4:go to (6.0, -0.4)");
+                if (mission_pos_cruise_avoid(6.0, -0.4, ALTITUDE, 0.0, err_max)) {
                     mission_num = 5;
                     last_request = ros::Time::now();
                 }
                 break;
-
             case 5:
-                ROS_INFO_ONCE("任务5: 飞往目标区域 (35, 0)");
-                if (mission_pos_cruise_avoid(35.0, 0.0, ALTITUDE, 0.0, err_max))
-                {
-                    mission_num = 6;
+    		ROS_INFO_ONCE("任务5: 在门前悬停3秒");
+    		mission_pos_cruise_avoid(11.0, -0.4, ALTITUDE, 0.0, err_max);
+    		if (ros::Time::now() - last_request > ros::Duration(3.0)) {
+        		mission_num = 6;
+    		}
+    		break;
+
+            case 6:
+                ROS_INFO_ONCE("任务6: 穿第一个通道 (16.5, -0.4)");
+                if (mission_pos_cruise_avoid(16.5, -0.4, ALTITUDE, 0.0, err_max)) {
+                    mission_num = 7;
                     last_request = ros::Time::now();
                 }
                 break;
 
-            case 6:
-                ROS_INFO_ONCE("任务6: 寻找匹配降落点...");
+            case 7:
+                ROS_INFO_ONCE("任务7: go to (16.5, 2.4)");
+                if (mission_pos_cruise_avoid(16.5, 2.4, ALTITUDE, 0.0, err_max)) {
+                    mission_num = 71;
+                    last_request = ros::Time::now();
+                }
+                break;
+            case 71:
+    		ROS_INFO_ONCE("任务71: 在门前悬停3秒");
+    		mission_pos_cruise_avoid(16.5, 2.4, ALTITUDE, 0.0, err_max);
+    		if (ros::Time::now() - last_request > ros::Duration(3.0)) {
+        		mission_num = 8; 
+    		}
+    		break;
+	    case 8:
+                ROS_INFO_ONCE("任务8: 穿第一个通道 (20.5, 2.4)");
+                if (mission_pos_cruise_avoid(20.5, 2.4, ALTITUDE, 0.0, err_max)) {
+                    ROS_INFO("成功穿门！");
+                    mission_num = 9;
+                    last_request = ros::Time::now();
+                }
+                break;
+                
+            case 9:
+                ROS_INFO_ONCE("任务9: go to (20.5, 0.2)");
+                if (mission_pos_cruise_avoid(20.5, 0.2, ALTITUDE, 0.0, err_max)) {
+                    mission_num = 91;
+                    last_request = ros::Time::now();
+                }
+                break;
+            case 91:
+    		ROS_INFO_ONCE("任务91: 在门前悬停3秒");
+    		mission_pos_cruise_avoid(20.5, 0.2, ALTITUDE, 0.0, err_max);
+    		if (ros::Time::now() - last_request > ros::Duration(3.0)) {
+        		mission_num = 10; // 然后穿门
+    		}
+    		break;    
+            case 10:
+                ROS_INFO_ONCE("任务10: 穿矩形门 (24, 0.2)");
+                if (mission_pos_cruise_avoid(24.0, 0.2, ALTITUDE, 0.0, err_max)) {
+                    ROS_INFO("成功穿门！");
+                    mission_num = 11;
+                    last_request = ros::Time::now();
+                }
+                break;
+
+            case 11:
+                ROS_INFO_ONCE("任务11: 飞往目标区域 (35, 0)");
+                if (mission_pos_cruise_avoid(35.0, 0.0, ALTITUDE, 0.0, err_max)) {
+                    mission_num = 12;
+                    last_request = ros::Time::now();
+                }
+                break;
+
+            case 12:
+                ROS_INFO_ONCE("任务12: 寻找匹配降落点...");
                 {
                     int target_id = call_find_target();
                     if (target_id > 0) {
                         target_color_id = target_id;
-                        mission_num = 7;
+                        mission_num = 13;
                         last_request = ros::Time::now();
                     } else if (ros::Time::now() - last_request >= ros::Duration(8.0)) {
-                        mission_num = 8;
+                        mission_num = 14;
                         search_step = 0;
                         last_request = ros::Time::now();
                     }
                 }
-                // 使用普通巡航（无避障）
-                mission_pos_cruise(35.0, 0.0, ALTITUDE, 0.0, err_max);
+                mission_pos_cruise_avoid(35.0, 0.0, ALTITUDE, 0.0, err_max);
                 break;
 
-            case 7:
+            case 13:
                 if (target_color_id > 0 && target_points.count(target_color_id)) {
                     auto point = target_points[target_color_id];
-                    ROS_INFO_ONCE("任务7: 飞往颜色%d降落点 (%.1f, %.1f)", target_color_id, point[0], point[1]);
-                    if (mission_pos_cruise(point[0], point[1], ALTITUDE, 0.0, err_max)) {
-                        mission_num = 9;
+                    ROS_INFO_ONCE("任务13: 飞往颜色%d降落点 (%.1f, %.1f)", target_color_id, point[0], point[1]);
+                    if (mission_pos_cruise_avoid(point[0], point[1], ALTITUDE, 0.0, err_max)) {
+                        mission_num = 15;
                         last_request = ros::Time::now();
                     }
                 } else {
-                    mission_num = 8;
+                    mission_num = 14;
                     search_step = 0;
                 }
                 break;
 
-            case 8:
-                ROS_INFO_ONCE("任务8: 搜索模式 - 步骤 %d", search_step + 1);
+            case 14:
+                ROS_INFO_ONCE("任务14: 搜索模式 - 步骤 %d", search_step + 1);
                 if (search_step < 3) {
-                    if (mission_pos_cruise(search_points[search_step][0], search_points[search_step][1], ALTITUDE, 0.0, err_max)) {
+                    float search_points[3][2] = {{35, -2}, {35, 0}, {35, 2}};
+                    if (mission_pos_cruise_avoid(search_points[search_step][0], search_points[search_step][1], ALTITUDE, 0.0, err_max)) {
                         int target_id = call_find_target();
                         if (target_id > 0) {
                             target_color_id = target_id;
-                            mission_num = 7;
+                            mission_num = 13;
                         } else {
                             search_step++;
                             last_request = ros::Time::now();
                         }
                     }
                 } else {
-                    ROS_ERROR("搜索失败");
-                    mission_num = -1;
+                    ROS_ERROR("搜索失败，使用默认黄色降落点");
+                    target_color_id = 2;
+                    mission_num = 13;
                 }
                 break;
 
-            case 9:
-                ROS_INFO_ONCE("任务9: 开始降落");
+            case 15:
+                ROS_INFO_ONCE("任务15: 开始精准降落");
                 if (precision_land()) {
                     mission_num = -1;
                 }
@@ -356,7 +430,7 @@ int main(int argc, char **argv)
 
             default:
                 if (mission_num == -1) {
-                    ROS_INFO("=== 任务完成! ===");
+                    ROS_INFO("=== 任务成功完成! ===");
                     return 0;
                 }
                 break;
